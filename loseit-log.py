@@ -48,12 +48,12 @@ except ImportError:
 
 SERVICE_URL = "https://www.loseit.com/web/service"
 BASE_URL = "https://d3hsih69yn4d89.cloudfront.net/web/"
-POLICY_HASH = "5ED2771F63B26294E45551B2D697E7B0"
-STRONG_NAME = "24BBC590737D4E7508A96609A56E11F3"
-USER_ID = "47596378"
-USER_NAME = "Rich"
+POLICY_HASH = os.environ.get("LOSEIT_POLICY_HASH", "5ED2771F63B26294E45551B2D697E7B0")
+STRONG_NAME = os.environ.get("LOSEIT_STRONG_NAME", "24BBC590737D4E7508A96609A56E11F3")
+USER_ID = os.environ.get("LOSEIT_USER_ID", "47596378")
+USER_NAME = os.environ.get("LOSEIT_USER_NAME", "Rich")
 TOKEN_FILE = os.path.expanduser("~/.config/loseit/token")
-HOURS_FROM_GMT = -5
+HOURS_FROM_GMT = int(os.environ.get("LOSEIT_HOURS_FROM_GMT", "-5"))
 
 MEAL_TYPES = {
     "breakfast": 0, "lunch": 1, "dinner": 2, "snacks": 3, "snack": 3,
@@ -888,6 +888,376 @@ def log_food(session, food, meal: str, when: date, servings: float, debug=False)
     return True
 
 
+# ─── getDailyDetailsIncludingPendingForDate ─────────────────────────────────
+
+def build_get_daily_details_payload(target_date: date, day_key: str) -> str:
+    """Build getDailyDetailsIncludingPendingForDate GWT-RPC payload.
+
+    Returns the wire payload for fetching today's food/exercise/notes/goals.
+    """
+    strings = [
+        BASE_URL,
+        POLICY_HASH,
+        "com.loseit.core.client.service.LoseItRemoteService",
+        "getDailyDetailsIncludingPendingForDate",
+        "com.loseit.core.client.service.ServiceRequestToken/1076571655",
+        "com.loseit.core.shared.model.DayDate/1611136587",
+        "com.loseit.core.client.model.UserId/4281239478",
+        USER_NAME,
+        "java.util.Date/3385151746",
+    ]
+    header = f"7|0|{len(strings)}|" + "|".join(strings) + "|"
+    day_num = day_number_for(target_date)
+    data = (
+        f"1|2|3|4|2|5|6|"
+        f"5|0|7|{USER_ID}|8|{HOURS_FROM_GMT}|"
+        f"6|9|{day_key}|{day_num}|{HOURS_FROM_GMT}|"
+    )
+    return header + data
+
+
+# Nutrient ordinal → label (the 9 core nutrients tracked by the API)
+NUTRIENT_NAMES = {
+    0: "Calories", 2: "Fat", 3: "Sat Fat", 8: "Cholesterol",
+    9: "Sodium", 10: "Carbs", 11: "Fiber", 12: "Sugar", 13: "Protein",
+}
+
+
+def parse_daily_details_response(text):
+    """Parse getDailyDetailsIncludingPendingForDate → list of FoodLogEntry dicts.
+
+    Each entry dict contains the data needed to construct a deleteFoodLogEntry
+    payload: PKs, day keys, meal/extra ordinals, food info, servings, nutrients,
+    and the FoodMeasure ordinal.
+
+    GWT serializes objects in reverse, so the response is parsed by walking the
+    token stream and anchoring on SimplePrimaryKey markers (the 16,[B_ref,PK_ref
+    triple). For each FoodLogEntry the diary contains TWO consecutive PK blocks
+    sharing the same day_key — the first is the FOOD primary key (inside the
+    FoodIdentifier) and the second is the ENTRY primary key.
+    """
+    tokens, strings = parse_gwt_response(text)
+    if not strings:
+        return []
+
+    # Resolve all the type refs we care about
+    refs = {}
+    for i, s in enumerate(strings):
+        r = i + 1
+        if s == "[B/3308590456": refs["bytes"] = r
+        elif s.startswith("com.loseit.core.client.model.SimplePrimaryKey/"): refs["pk"] = r
+        elif s.startswith("com.loseit.core.client.model.FoodLogEntry/"): refs["food_log_entry"] = r
+        elif s.startswith("com.loseit.core.client.model.interfaces.FoodLogEntryType/"): refs["meal"] = r
+        elif s.startswith("com.loseit.core.client.model.interfaces.FoodLogEntryTypeExtra/"): refs["extra"] = r
+        elif s.startswith("com.loseit.core.client.model.FoodMeasure/"): refs["food_measure"] = r
+        elif s.startswith("com.loseit.healthdata.model.shared.food.FoodMeasurement/"): refs["food_measurement"] = r
+        elif s == "java.lang.Double/858496421": refs["double"] = r
+        elif s.startswith("java.util.HashMap/"): refs["hashmap"] = r
+        elif s.startswith("com.loseit.core.client.model.FoodIdentifier/"): refs["food_id"] = r
+
+    if not (refs.get("bytes") and refs.get("pk")):
+        return []
+
+    bytes_ref = refs["bytes"]
+    pk_ref = refs["pk"]
+
+    # Locate all PK blocks: 16 numeric tokens followed by [16, bytes_ref, pk_ref, "<day_key>"]
+    pk_blocks = []
+    for i in range(16, len(tokens) - 3):
+        if (tokens[i] == 16 and tokens[i+1] == bytes_ref and tokens[i+2] == pk_ref
+                and isinstance(tokens[i+3], str)):
+            byte_slice = tokens[i-16:i]
+            if all(isinstance(x, (int, float)) for x in byte_slice):
+                pk_blocks.append({
+                    "marker_i": i,
+                    "pk_bytes": [int(x) for x in byte_slice],
+                    "day_key": tokens[i+3],
+                })
+
+    # Group consecutive blocks by day_key. A FoodLogEntry has TWO PK blocks with
+    # the same day_key (first = food PK, second = entry PK). Filter out non-food
+    # objects (daily-summary, custom-goals, weight entries) by requiring:
+    #   1. Same day_key on both PKs
+    #   2. A food identifier code (a "Do…"-prefixed string) follows the first marker
+    #   3. The FoodLogEntry type ref appears after the second marker
+    food_id_re = re.compile(r"^Do[A-Za-z0-9]+$")
+    fle_ref = refs.get("food_log_entry")
+    entries = []
+    i = 0
+    while i < len(pk_blocks) - 1:
+        a, b = pk_blocks[i], pk_blocks[i+1]
+        if a["day_key"] != b["day_key"]:
+            i += 1
+            continue
+        after_first = tokens[a["marker_i"] + 4] if a["marker_i"] + 4 < len(tokens) else None
+        has_food_code = isinstance(after_first, str) and food_id_re.match(after_first)
+        # Search a small window after the second marker for the FoodLogEntry ref
+        has_fle_ref = False
+        if fle_ref is not None:
+            for j in range(b["marker_i"] + 4, min(b["marker_i"] + 20, len(tokens))):
+                if tokens[j] == fle_ref:
+                    has_fle_ref = True
+                    break
+        if not (has_food_code and has_fle_ref):
+            i += 1
+            continue
+        entry = _extract_food_log_entry(tokens, strings, a, b, refs)
+        if entry:
+            entries.append(entry)
+        i += 2
+    return entries
+
+
+def _extract_food_log_entry(tokens, strings, food_pk_block, entry_pk_block, refs):
+    """Extract one FoodLogEntry from token stream between food_pk and entry_pk markers."""
+    food_pk = food_pk_block["pk_bytes"]   # FIRST PK in stream = FOOD PK
+    entry_pk = entry_pk_block["pk_bytes"]  # SECOND PK in stream = ENTRY PK
+    day_key = food_pk_block["day_key"]
+    # Token range covering this entry's middle data (between the two PK markers)
+    mid_start = food_pk_block["marker_i"] + 4  # after [16, bytes_ref, pk_ref, day_key]
+    mid_end = entry_pk_block["marker_i"] - 16  # before the entry_pk bytes
+
+    # Food identifier code: the string immediately after the first marker+day_key
+    food_id_code = tokens[mid_start] if mid_start < len(tokens) and isinstance(tokens[mid_start], str) else ""
+
+    # FoodMeasure ordinal: in response order this comes after the 3 servings copies
+    food_measure_ord = None
+    fm_ref = refs.get("food_measure")
+    if fm_ref:
+        # Walk forward from mid_start; ordinal precedes the food_measure_ref token
+        for j in range(mid_start, min(mid_end, mid_start + 20)):
+            if tokens[j] == fm_ref and j > 0 and isinstance(tokens[j-1], (int, float)):
+                food_measure_ord = int(tokens[j-1])
+                break
+
+    # Nutrient values: response has reversed pattern <value, double_ref, ordinal, food_measurement_ref>
+    # We extract (ordinal, value) pairs preserving the order they appear in stream.
+    nutrients_ordered = []
+    fmment_ref = refs.get("food_measurement")
+    dbl_ref = refs.get("double")
+    if fmment_ref and dbl_ref:
+        for j in range(mid_start, mid_end):
+            if (tokens[j] == fmment_ref and j >= 3 and tokens[j-2] == dbl_ref
+                    and isinstance(tokens[j-1], int) and isinstance(tokens[j-3], (int, float))):
+                ord_ = int(tokens[j-1])
+                val = float(tokens[j-3])
+                if 0 <= ord_ <= 30:
+                    nutrients_ordered.append((ord_, val))
+
+    # Meal ordinal: search for meal-ref token (FoodLogEntryType); ordinal precedes it
+    meal_ord = 0
+    if refs.get("meal"):
+        for j in range(mid_start, mid_end):
+            if tokens[j] == refs["meal"] and j > 0 and isinstance(tokens[j-1], int):
+                meal_ord = int(tokens[j-1])
+                break
+
+    # Extra ordinal: search for FoodLogEntryTypeExtra ref; ordinal precedes it
+    extra_ord = 3  # default ExtraNone
+    if refs.get("extra"):
+        for j in range(mid_start, mid_end):
+            if tokens[j] == refs["extra"] and j > 0 and isinstance(tokens[j-1], int):
+                extra_ord = int(tokens[j-1])
+                break
+
+    # Context day_key + day_num + hours.
+    # In the response stream (reverse of request), the context section comes
+    # AFTER nutrients as: ..., hours_from_gmt, day_num, "<context_day_key>", ...
+    # Filter out the food identifier code (starts with "Do") to find the real
+    # day key (which starts with "Z" or "_").
+    context_day_key = ""
+    day_num = 0
+    hours_from_gmt = HOURS_FROM_GMT
+    for j in range(mid_start, mid_end):
+        t = tokens[j]
+        if (isinstance(t, str) and t != day_key and not t.startswith("Do")
+                and re.match(r"^[A-Za-z0-9_$]+$", t) and len(t) >= 5):
+            context_day_key = t
+            # day_num precedes the context_day_key (a large int >= 5000)
+            for k in range(j-1, max(j-6, mid_start), -1):
+                if isinstance(tokens[k], int) and tokens[k] >= 5000:
+                    day_num = int(tokens[k])
+                    break
+            # hours_from_gmt precedes day_num (negative int in -12..14)
+            for k in range(j-1, max(j-8, mid_start), -1):
+                if isinstance(tokens[k], int) and -12 <= tokens[k] <= 14 and tokens[k] != day_num:
+                    hours_from_gmt = int(tokens[k])
+                    break
+            break
+
+    # Food category/name/brand: walk tokens AFTER the entry_pk_block looking for
+    # 3 string-refs to short food-info strings (heuristic).
+    food_category = food_name = food_brand = ""
+    after = entry_pk_block["marker_i"] + 4  # after [16, bytes_ref, pk_ref, day_key]
+    seen_strings = []
+    for j in range(after, min(after + 15, len(tokens))):
+        t = tokens[j]
+        if isinstance(t, int) and 1 <= t <= len(strings):
+            s = strings[t-1]
+            if s and not (s.startswith("com.") or s.startswith("java.") or s.startswith("[")):
+                seen_strings.append(s)
+                if len(seen_strings) >= 3:
+                    break
+    if len(seen_strings) >= 3:
+        # Order in response (reversed from request): brand, name, category
+        food_brand, food_name, food_category = seen_strings[:3]
+    elif len(seen_strings) == 2:
+        food_name, food_category = seen_strings
+    elif len(seen_strings) == 1:
+        food_name = seen_strings[0]
+
+    # Servings: usually appears as 3 identical floats right after food_id_code
+    servings = 1.0
+    if mid_start + 4 < len(tokens):
+        for j in range(mid_start + 1, mid_start + 5):
+            if isinstance(tokens[j], float):
+                servings = float(tokens[j])
+                break
+
+    return {
+        "food_pk_response": food_pk,
+        "entry_pk_response": entry_pk,
+        "entry_day_key": day_key,
+        "context_day_key": context_day_key,
+        "day_num": day_num,
+        "hours_from_gmt": hours_from_gmt,
+        "meal_ordinal": meal_ord,
+        "extra_ordinal": extra_ord,
+        "food_measure_ordinal": food_measure_ord if food_measure_ord is not None else 27,
+        "servings": servings,
+        "food_identifier_code": food_id_code,
+        "food_category": food_category,
+        "food_name": food_name,
+        "food_brand": food_brand,
+        "nutrients_ordered": nutrients_ordered,
+    }
+
+
+def get_daily_food_log_entries(session, target_date: date, debug=False):
+    """Fetch today's diary; return parsed list of FoodLogEntry dicts."""
+    day_num = day_number_for(target_date)
+    day_key = get_daydate_key(session, day_num, debug=debug) or ""
+    if not day_key:
+        print(f"⚠️  Could not resolve day key for {target_date}; using empty key")
+    payload = build_get_daily_details_payload(target_date, day_key)
+    resp = gwt_call(session, payload, debug=debug)
+    if not resp:
+        return []
+    return parse_daily_details_response(resp)
+
+
+def display_diary(entries, target_date: date):
+    """Print today's diary entries with indexes per meal."""
+    if not entries:
+        print(f"  (no entries for {target_date.isoformat()})")
+        return
+    by_meal = {0: [], 1: [], 2: [], 3: []}
+    for e in entries:
+        by_meal.setdefault(e["meal_ordinal"], []).append(e)
+    print(f"\n📅 Diary for {target_date.isoformat()}:")
+    for m_ord in sorted(by_meal.keys()):
+        meal_entries = by_meal[m_ord]
+        if not meal_entries:
+            continue
+        print(f"\n  {MEAL_NAMES.get(m_ord, f'meal{m_ord}')}:")
+        for i, e in enumerate(meal_entries):
+            cals = next((v for ord_, v in e["nutrients_ordered"] if ord_ == 0), None)
+            brand = f" ({e['food_brand']})" if e["food_brand"] else ""
+            cal_str = f"  [{cals:.0f} cal]" if cals is not None else ""
+            print(f"    {i+1}. {e['food_name']}{brand}  × {e['servings']}{cal_str}")
+
+
+# ─── deleteFoodLogEntry ─────────────────────────────────────────────────────
+
+def build_delete_food_log_entry_payload(entry):
+    """Construct a deleteFoodLogEntry GWT-RPC payload from a parsed diary entry.
+
+    Mirrors the wire format captured from the LoseIt web UI's Delete action.
+    The entry's FoodIdentifier (with food PK), context, meal type, FoodServing
+    with nutrients, FoodServingSize/FoodMeasure, and finally the entry's own
+    SimplePrimaryKey are all serialized.
+    """
+    strings = [
+        BASE_URL,                                                              # 1
+        POLICY_HASH,                                                           # 2
+        "com.loseit.core.client.service.LoseItRemoteService",                  # 3
+        "deleteFoodLogEntry",                                                  # 4
+        "com.loseit.core.client.service.ServiceRequestToken/1076571655",       # 5
+        "com.loseit.core.client.model.FoodLogEntry/264522954",                 # 6
+        "com.loseit.core.client.model.UserId/4281239478",                      # 7
+        USER_NAME,                                                             # 8
+        "com.loseit.core.client.model.FoodIdentifier/2763145970",              # 9
+        entry.get("food_category") or "Food",                                  # 10
+        entry.get("food_name") or "",                                          # 11
+        entry.get("food_brand") or "",                                         # 12
+        "com.loseit.core.client.model.interfaces.FoodProductType/2860616120",  # 13
+        "com.loseit.core.client.model.SimplePrimaryKey/3621315060",            # 14
+        "[B/3308590456",                                                       # 15
+        "com.loseit.core.client.model.FoodLogEntryContext/4082213671",         # 16
+        "com.loseit.core.shared.model.DayDate/1611136587",                     # 17
+        "java.util.Date/3385151746",                                           # 18
+        "com.loseit.core.client.model.interfaces.FoodLogEntryType/1152459170",       # 19
+        "com.loseit.core.client.model.interfaces.FoodLogEntryTypeExtra/4048538730",  # 20
+        "com.loseit.core.client.model.FoodServing/1858865662",                 # 21
+        "com.loseit.core.client.model.FoodNutrients/1097231324",               # 22
+        "java.util.HashMap/1797211028",                                        # 23
+        "com.loseit.healthdata.model.shared.food.FoodMeasurement/2371921172",  # 24
+        "java.lang.Double/858496421",                                          # 25
+        "com.loseit.core.client.model.FoodServingSize/63998910",               # 26
+        "com.loseit.core.client.model.FoodMeasure/1457474932",                 # 27
+    ]
+    header = f"7|0|{len(strings)}|" + "|".join(strings) + "|"
+
+    servings = entry.get("servings", 1.0)
+    servings_str = str(int(servings)) if servings == int(servings) else str(servings)
+
+    def fmt_num(v):
+        return str(int(v)) if v == int(v) else str(v)
+
+    entry_pk = entry["entry_pk_response"]
+    food_pk = entry["food_pk_response"]
+    nutrients = entry.get("nutrients_ordered") or []
+
+    parts = []
+    # Method invocation
+    parts += ["1", "2", "3", "4"]
+    # 2 params: ServiceRequestToken, FoodLogEntry
+    parts += ["2", "5", "6"]
+    # ServiceRequestToken
+    parts += ["5", "0", "7", USER_ID, "8", str(HOURS_FROM_GMT)]
+    # FoodLogEntry header + FoodIdentifier section
+    parts += ["6", "9", "-1", "10", "0", "11", "12", "13", "0", "-1", "0",
+              entry["entry_day_key"], "14", "15", "16"]
+    # ENTRY PK bytes — first PK position in REQUEST (FoodLogEntry's own SimplePrimaryKey).
+    # Note: response stream has FOOD PK first then ENTRY PK; request order is the opposite.
+    parts += [str(int(b)) for b in reversed(entry_pk)]
+    # FoodLogEntryContext + DayDate
+    parts += ["16", "0", "17", "18",
+              entry["context_day_key"], str(entry["day_num"]), str(entry["hours_from_gmt"]),
+              "0", "-1", "1", "0", "0", "0"]
+    # Meal type + extra
+    parts += ["19", str(entry["meal_ordinal"]), "20", str(entry["extra_ordinal"])]
+    # FoodServing + FoodNutrients
+    parts += ["21", "22", servings_str, servings_str, "23", str(len(nutrients))]
+    # Nutrients (HashMap iteration order preserved from server)
+    for ord_, val in nutrients:
+        parts += ["24", str(int(ord_)), "25", fmt_num(val)]
+    # FoodServingSize + FoodMeasure + food code
+    parts += ["26", servings_str, "0", "27", str(entry["food_measure_ordinal"]),
+              servings_str, servings_str, servings_str, "0", entry["food_identifier_code"]]
+    # FOOD PK section — second PK position (the food's PK inside FoodIdentifier).
+    parts += [entry["entry_day_key"], "14", "15", "16"]
+    parts += [str(int(b)) for b in reversed(food_pk)]
+    return header + "|".join(parts) + "|"
+
+
+def delete_food_log_entry(session, entry, debug=False):
+    """Send deleteFoodLogEntry; return True on success."""
+    payload = build_delete_food_log_entry_payload(entry)
+    resp = gwt_call(session, payload, debug=debug)
+    return resp is not None
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -906,10 +1276,14 @@ def main():
                         help="Meal type (default: snacks)")
     parser.add_argument("--replay", action="store_true",
                         help="Replay captured Chobani yogurt save (auth test)")
+    parser.add_argument("--list", dest="list_diary", action="store_true",
+                        help="List today's diary entries (use --date to view another day)")
     parser.add_argument("--delete", action="store_true",
-                        help="Replay captured deleteFoodLogEntry payload (dangerous)")
+                        help="Delete a diary entry. Pair with --pick N (-m MEAL) to choose which entry.")
+    parser.add_argument("--delete-replay", action="store_true",
+                        help="Replay the original author's captured Chobani delete payload (legacy)")
     parser.add_argument("--yes", action="store_true",
-                        help="Skip confirmation for --delete")
+                        help="Skip confirmation for --delete / --delete-replay")
     parser.add_argument("--search", "-s", action="store_true",
                         help="Search only, don't log")
     parser.add_argument("--servings", type=float, default=1.0,
@@ -917,7 +1291,7 @@ def main():
     parser.add_argument("--date", dest="date", default=None,
                         help="Target date YYYY-MM-DD (default: today)")
     parser.add_argument("--pick", type=int, default=None,
-                        help="Auto-pick Nth search result (1-indexed)")
+                        help="Auto-pick Nth search result OR Nth diary entry (1-indexed)")
     parser.add_argument("--debug", "-d", action="store_true",
                         help="Show debug output")
     parser.add_argument("--raw", action="store_true",
@@ -925,7 +1299,7 @@ def main():
 
     args = parser.parse_args()
 
-    if not args.replay and not args.delete and not args.food:
+    if not args.replay and not args.delete and not args.delete_replay and not args.list_diary and not args.food:
         parser.print_help()
         sys.exit(1)
 
@@ -937,10 +1311,57 @@ def main():
         success = do_replay(session, debug=args.debug)
         sys.exit(0 if success else 1)
 
-    # ── Replay delete mode ──
-    if args.delete:
+    # ── Legacy replay delete mode (captured Chobani payload) ──
+    if args.delete_replay:
         success = do_delete_replay(session, debug=args.debug, yes=args.yes)
         sys.exit(0 if success else 1)
+
+    # ── List diary mode ──
+    when = parse_date_arg(args.date)
+    if args.list_diary:
+        entries = get_daily_food_log_entries(session, when, debug=args.debug)
+        display_diary(entries, when)
+        sys.exit(0)
+
+    # ── Delete diary entry mode ──
+    if args.delete:
+        entries = get_daily_food_log_entries(session, when, debug=args.debug)
+        if not entries:
+            print(f"❌ No diary entries for {when.isoformat()}")
+            sys.exit(1)
+        # Filter to the requested meal
+        meal_ord = MEAL_TYPES[args.meal]
+        meal_entries = [e for e in entries if e["meal_ordinal"] == meal_ord]
+        if not meal_entries:
+            print(f"❌ No entries logged to {MEAL_NAMES[meal_ord]} on {when.isoformat()}")
+            display_diary(entries, when)
+            sys.exit(1)
+        if args.pick is None:
+            display_diary(entries, when)
+            print(f"\nUse --pick N to choose an entry from {MEAL_NAMES[meal_ord]} (1..{len(meal_entries)})")
+            sys.exit(1)
+        idx = args.pick - 1
+        if idx < 0 or idx >= len(meal_entries):
+            print(f"❌ --pick must be 1..{len(meal_entries)} for {MEAL_NAMES[meal_ord]}")
+            sys.exit(1)
+        target = meal_entries[idx]
+        brand_str = f" ({target['food_brand']})" if target['food_brand'] else ""
+        print(f"🗑️  Deleting from {MEAL_NAMES[meal_ord]}: {target['food_name']}{brand_str} × {target['servings']}")
+        if not args.yes:
+            try:
+                ans = input("Confirm? type 'delete' to proceed: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print("\nCancelled.")
+                sys.exit(0)
+            if ans != "delete":
+                print("Cancelled.")
+                sys.exit(0)
+        ok = delete_food_log_entry(session, target, debug=args.debug)
+        if ok:
+            print("✅ Deleted")
+            sys.exit(0)
+        print("❌ Delete failed")
+        sys.exit(1)
 
     # ── Search ──
     foods = search_foods(session, args.food, debug=args.debug)

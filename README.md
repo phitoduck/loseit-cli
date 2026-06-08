@@ -11,11 +11,11 @@ Unofficial command-line tools for Lose It! - download your data, log foods, and 
 - **Analyze trends** - Generate JSON reports with averages, streaks, and insights
 - **Search foods** - Search Lose It's database from the command line
 - **Log entries** - Add foods to your diary with custom servings and dates
+- **List diary** - Show today's (or any day's) food log entries with per-meal indexes
+- **Delete entries** - Remove a diary entry by meal + index
 - **Multiple meals** - Breakfast, lunch, dinner, snacks
 
 ### ⏳ Planned (v2.0)
-- Query today's diary
-- Delete entries
 - Edit existing entries
 - Token auto-refresh
 
@@ -106,6 +106,43 @@ python3 loseit-log.py "eggs" -m breakfast --pick 1 --date 2026-01-31
 
 **Meals:** `breakfast`, `lunch`, `dinner`, `snacks`
 
+### List & Delete Diary Entries
+
+Show today's diary with per-meal indexes:
+```bash
+python3 loseit-log.py --list                 # today
+python3 loseit-log.py --list --date 2026-06-08
+```
+
+Delete an entry by index within a meal:
+```bash
+# Prompts for confirmation:
+python3 loseit-log.py --delete -m lunch --pick 1
+
+# Non-interactive:
+python3 loseit-log.py --delete -m lunch --pick 1 --yes
+```
+
+> **Note**: The old `--delete` (replay the captured Chobani delete payload) is
+> still available as `--delete-replay`.
+
+### Per-user Configuration (optional)
+
+By default the script's `USER_ID` / `USER_NAME` / GWT signature constants are
+hard-coded to the original author's values. You can override them with
+environment variables so the script works for your account without editing
+the source:
+
+```bash
+export LOSEIT_USER_ID=12345678            # 'sub' claim of your liauth JWT
+export LOSEIT_USER_NAME=your.username     # your loseit.com username
+export LOSEIT_HOURS_FROM_GMT=-5           # your timezone offset from UTC
+# These tend to change every time LoseIt redeploys their web app — grab fresh
+# values from DevTools → Network on a /web/service POST:
+export LOSEIT_POLICY_HASH=...              # 5th '|'-separated field of request body
+export LOSEIT_STRONG_NAME=...              # x-gwt-permutation request header
+```
+
 ### Examples
 
 ```bash
@@ -117,6 +154,9 @@ python3 loseit-log.py "grilled salmon" -m dinner --pick 1 --servings 1.5
 
 # Log coffee from yesterday
 python3 loseit-log.py "coffee black" -m breakfast --pick 1 --date 2026-02-01
+
+# Delete the 1st item in lunch
+python3 loseit-log.py --delete -m lunch --pick 1 --yes
 
 # Debug mode (see API calls)
 python3 loseit-log.py "banana" -m snacks --pick 1 --debug
